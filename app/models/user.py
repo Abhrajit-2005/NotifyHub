@@ -1,8 +1,12 @@
 import uuid
 from datetime import datetime
+from typing import TYPE_CHECKING, List
 from sqlalchemy import String, Boolean, DateTime, Uuid, func
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
+
+if TYPE_CHECKING:
+    from app.models.notification import Notification
 
 class User(Base):
     __tablename__ = "users"
@@ -38,3 +42,10 @@ class User(Base):
         onupdate=func.now(),
         nullable=False
     )
+
+    notifications: Mapped[List["Notification"]] = relationship(
+        "Notification",
+        back_populates="user",
+        cascade="all, delete-orphan"
+    )
+

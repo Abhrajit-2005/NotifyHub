@@ -1,6 +1,9 @@
-# NotifyHub - Phase 1 Backend Infrastructure
+# NotifyHub - Phase 1 & 2 Backend Infrastructure
 
-NotifyHub is a production-style notification infrastructure backend designed to handle authentication, notification routing, and dispatching. Phase 1 provides the foundational backend setup with user authentication, security features, database migrations, and containerization.
+NotifyHub is a production-style notification infrastructure backend designed to handle user authentication, notification management, routing, and dispatching.
+
+Phase 1 provides the foundational backend setup with user authentication, security features, database migrations, and containerization.
+Phase 2 provides the core notification management API with structured schemas, database persistence, status tracking, pagination, and tenant isolation via JWT security.
 
 ---
 
@@ -28,32 +31,40 @@ NotifyHub/
 ├── app/
 │   ├── main.py                  # FastAPI application entry point & router mounting
 │   ├── api/
-│   │   ├── deps.py              # Reusable authentication & database dependencies
+│   │   ├── deps.py              # Reusable authentication & service dependencies
 │   │   └── v1/
 │   │       ├── auth.py          # Authentication router (/api/v1/auth)
-│   │       └── health.py        # Health check router (/api/v1/health)
+│   │       ├── health.py        # Health check router (/api/v1/health)
+│   │       └── notifications.py # Notification management router (/api/v1/notifications)
 │   ├── core/
 │   │   ├── config.py            # Environment configuration settings (BaseSettings)
 │   │   ├── database.py          # SQLAlchemy 2.0 engine & session setup
 │   │   └── security.py          # Password hashing (bcrypt) & JWT token utilities
 │   ├── models/
-│   │   └── user.py              # SQLAlchemy 2.0 User model (users table)
+│   │   ├── enums.py             # NotificationType, NotificationChannel, NotificationStatus enums
+│   │   ├── user.py              # SQLAlchemy 2.0 User model (users table)
+│   │   └── notification.py      # SQLAlchemy 2.0 Notification model (notifications table)
 │   ├── schemas/
 │   │   ├── auth.py              # Pydantic v2 Auth request/response validation
-│   │   └── user.py              # Pydantic v2 User schemas
+│   │   ├── user.py              # Pydantic v2 User schemas
+│   │   └── notification.py      # Pydantic v2 Notification schemas & paginated responses
 │   ├── services/
-│   │   └── auth_service.py      # Authentication business logic layer
+│   │   ├── auth_service.py      # Authentication business logic layer
+│   │   └── notification_service.py # Notification business logic layer
 │   └── repositories/
-│       └── user_repository.py   # Database query & persistence layer
+│       ├── user_repository.py   # User persistence layer
+│       └── notification_repository.py # Notification query & persistence layer
 ├── alembic/
 │   ├── env.py                   # Alembic environment runner
 │   ├── script.py.mpy            # Alembic revision template
 │   └── versions/
-│       └── 0001_create_users_table.py  # Initial migration script
+│       ├── 0001_create_users_table.py  # Initial migration script
+│       └── 0002_create_notifications_table.py # Notification table & enum migration
 ├── tests/
 │   ├── conftest.py              # Pytest fixtures and TestClient database overrides
 │   ├── test_health.py           # Health endpoint tests
-│   └── test_auth.py             # Registration, login, & security tests
+│   ├── test_auth.py             # Registration, login, & security tests
+│   └── test_notifications.py    # Core notification management endpoint tests
 ├── .env                         # Local environment variables
 ├── .env.example                 # Example environment variables template
 ├── .gitignore                   # Git ignore settings
@@ -130,12 +141,36 @@ alembic revision --autogenerate -m "describe_migration"
 To run the pytest suite:
 
 ```bash
-# Local environment with virtualenv
-pytest
-
-# Verbose test output
-pytest -v
+# Local virtual environment
+.\.venv\Scripts\pytest -v
 ```
+
+---
+
+## 🔄 Notification Lifecycle
+
+Each notification transitions through a structured status lifecycle:
+
+```text
+[ PENDING ] ──► [ PROCESSING ] ──► [ SENT ]
+                        │
+                        └──► [ FAILED ]
+```
+
+1. **`PENDING`**: Created and saved to the database. Initial default state.
+2. **`PROCESSING`**: Picked up for dispatching/processing.
+3. **`SENT`**: Successfully delivered to recipient channel (`sent_at` timestamp recorded).
+4. **`FAILED`**: Delivery failed after retries (`retry_count` incremented).
+
+---
+
+## 🔐 Security & Tenant Isolation
+
+All notification endpoints require a valid JWT Bearer token (`Authorization: Bearer <access_token>`).
+
+- **Recipient Binding**: Clients cannot specify an arbitrary `user_id`. The recipient user ID is derived strictly from the authenticated JWT token payload.
+- **Strict Isolation**: A user can never read, modify, or list notifications belonging to another user.
+- **404 Masking**: Attempting to fetch or update another user's notification returns a `404 Not Found` response to avoid exposing resource existence.
 
 ---
 
@@ -193,16 +228,108 @@ pytest -v
 
 ---
 
-## 🔐 Reusable Authentication Dependency
+### 4. Create Notification
+- **`POST /api/v1/notifications`** *(Requires Auth)*
+- **Request Body**:
+```json
+{
+  "type": "WELCOME",
+  "channel": "IN_APP",
+  "title": "Welcome to NotifyHub",
+  "content": "Thank you for signing up for our service!",
+  "idempotency_key": "unique-req-12345"
+}
+```
+- **Response**: `201 Created`
+```json
+{
+  "id": "a3b89012-e89b-12d3-a456-426614174000",
+  "user_id": "f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
+  "type": "WELCOME",
+  "channel": "IN_APP",
+  "title": "Welcome to NotifyHub",
+  "content": "Thank you for signing up for our service!",
+  "status": "PENDING",
+  "retry_count": 0,
+  "idempotency_key": "unique-req-12345",
+  "is_read": false,
+  "created_at": "2026-10-03T11:15:00Z",
+  "sent_at": null
+}
+```
 
-The `get_current_user` dependency in `app/api/deps.py` provides simple, reusable authentication for future protected routes:
+---
 
-```python
-from fastapi import Depends
-from app.api.deps import get_current_user
-from app.models.user import User
+### 5. List Authenticated User Notifications (Paginated)
+- **`GET /api/v1/notifications`** *(Requires Auth)*
+- **Query Parameters**:
+  - `page`: integer >= 1 (default `1`)
+  - `page_size`: integer 1-100 (default `20`)
+- **Response**: `200 OK` (Newest notifications first)
+```json
+{
+  "notifications": [
+    {
+      "id": "a3b89012-e89b-12d3-a456-426614174000",
+      "user_id": "f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
+      "type": "WELCOME",
+      "channel": "IN_APP",
+      "title": "Welcome to NotifyHub",
+      "content": "Thank you for signing up for our service!",
+      "status": "PENDING",
+      "retry_count": 0,
+      "idempotency_key": "unique-req-12345",
+      "is_read": false,
+      "created_at": "2026-10-03T11:15:00Z",
+      "sent_at": null
+    }
+  ],
+  "page": 1,
+  "page_size": 20,
+  "total": 1
+}
+```
 
-@router.get("/me")
-def read_current_user(current_user: User = Depends(get_current_user)):
-    return current_user
+---
+
+### 6. Get Single Notification
+- **`GET /api/v1/notifications/{notification_id}`** *(Requires Auth)*
+- **Response**: `200 OK`
+```json
+{
+  "id": "a3b89012-e89b-12d3-a456-426614174000",
+  "user_id": "f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
+  "type": "WELCOME",
+  "channel": "IN_APP",
+  "title": "Welcome to NotifyHub",
+  "content": "Thank you for signing up for our service!",
+  "status": "PENDING",
+  "retry_count": 0,
+  "idempotency_key": "unique-req-12345",
+  "is_read": false,
+  "created_at": "2026-10-03T11:15:00Z",
+  "sent_at": null
+}
+```
+
+---
+
+### 7. Mark IN_APP Notification as Read
+- **`PATCH /api/v1/notifications/{notification_id}/read`** *(Requires Auth)*
+- **Response**: `200 OK`
+```json
+{
+  "id": "a3b89012-e89b-12d3-a456-426614174000",
+  "user_id": "f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
+  "type": "WELCOME",
+  "channel": "IN_APP",
+  "title": "Welcome to NotifyHub",
+  "content": "Thank you for signing up for our service!",
+  "status": "PENDING",
+  "retry_count": 0,
+  "idempotency_key": "unique-req-12345",
+  "is_read": true,
+  "created_at": "2026-10-03T11:15:00Z",
+  "sent_at": null
+}
 ```

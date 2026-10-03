@@ -5,6 +5,8 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.security import decode_access_token
 from app.repositories.user_repository import UserRepository
+from app.repositories.notification_repository import NotificationRepository
+from app.services.notification_service import NotificationService
 from app.models.user import User
 
 security = HTTPBearer()
@@ -12,7 +14,16 @@ security = HTTPBearer()
 def get_user_repository(db: Session = Depends(get_db)) -> UserRepository:
     return UserRepository(db)
 
+def get_notification_repository(db: Session = Depends(get_db)) -> NotificationRepository:
+    return NotificationRepository(db)
+
+def get_notification_service(
+    repo: NotificationRepository = Depends(get_notification_repository)
+) -> NotificationService:
+    return NotificationService(repo)
+
 def get_current_user(
+
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db)
 ) -> User:
