@@ -1,12 +1,22 @@
 import pytest
 from unittest.mock import patch
+from fastapi import Depends
 from fastapi.testclient import TestClient
 
+from app.main import app
+from app.core.rate_limiter import check_rate_limit
+from app.api.deps import get_current_user
+
+async def override_check_rate_limit(current_user=Depends(get_current_user)):
+    return current_user
+
 @pytest.fixture(autouse=True)
-def mock_publisher():
+def mock_dependencies():
+    app.dependency_overrides[check_rate_limit] = override_check_rate_limit
     with patch("app.services.notification_service.publisher.publish_notification") as mock:
         mock.return_value = True
         yield mock
+    app.dependency_overrides.pop(check_rate_limit, None)
 
 def get_auth_headers(client: TestClient, email: str, password: str = "StrongPassword123!"):
 

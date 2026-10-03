@@ -8,6 +8,7 @@ from app.schemas.notification import (
     NotificationPaginatedResponse,
 )
 from app.services.notification_service import NotificationService
+from app.core.rate_limiter import check_rate_limit
 
 router = APIRouter(prefix="/notifications", tags=["Notifications"])
 
@@ -18,7 +19,7 @@ router = APIRouter(prefix="/notifications", tags=["Notifications"])
 )
 def create_notification(
     notification_in: NotificationCreate,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(check_rate_limit),
     service: NotificationService = Depends(get_notification_service),
 ):
     return service.create_notification(current_user.id, notification_in)
