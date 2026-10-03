@@ -5,6 +5,7 @@ from app.models.notification import Notification
 from app.models.enums import NotificationStatus, NotificationChannel
 from app.schemas.notification import NotificationCreate, NotificationPaginatedResponse, NotificationResponse
 from app.repositories.notification_repository import NotificationRepository
+from app.messaging import publisher
 
 class NotificationService:
     def __init__(self, notification_repo: NotificationRepository):
@@ -31,7 +32,13 @@ class NotificationService:
             idempotency_key=notification_in.idempotency_key,
             is_read=False,
         )
-        return self.notification_repo.create(notification)
+        saved_notification = self.notification_repo.create(notification)
+        
+        # Publish notification ID to RabbitMQ
+        publisher.publish_notification(saved_notification.id)
+        
+        return saved_notification
+
 
     def get_user_notifications(
         self, user_id: uuid.UUID, page: int = 1, page_size: int = 20

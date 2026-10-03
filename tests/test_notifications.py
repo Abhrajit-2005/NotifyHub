@@ -1,7 +1,15 @@
 import pytest
+from unittest.mock import patch
 from fastapi.testclient import TestClient
 
+@pytest.fixture(autouse=True)
+def mock_publisher():
+    with patch("app.services.notification_service.publisher.publish_notification") as mock:
+        mock.return_value = True
+        yield mock
+
 def get_auth_headers(client: TestClient, email: str, password: str = "StrongPassword123!"):
+
     client.post("/api/v1/auth/register", json={"email": email, "password": password})
     res = client.post("/api/v1/auth/login", json={"email": email, "password": password})
     token = res.json()["access_token"]

@@ -31,11 +31,52 @@ services:
       - .env
     environment:
       - POSTGRES_SERVER=db
+      - RABBITMQ_HOST=rabbitmq
     depends_on:
       db:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     command: >
       sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
 
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: notifyhub_worker
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_SERVER=db
+      - RABBITMQ_HOST=rabbitmq
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: >
+      sh -c "python -m worker.main"
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: notifyhub_rabbitmq
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   postgres_data:
+  rabbitmq_data:
