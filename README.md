@@ -1,9 +1,6 @@
-# NotifyHub - Phase 1 & 2 Backend Infrastructure
+# NotifyHub - Backend Infrastructure
 
 NotifyHub is a production-style notification infrastructure backend designed to handle user authentication, notification management, routing, and dispatching.
-
-Phase 1 provides the foundational backend setup with user authentication, security features, database migrations, and containerization.
-Phase 2 provides the core notification management API with structured schemas, database persistence, status tracking, pagination, and tenant isolation via JWT security.
 
 ---
 
@@ -12,6 +9,8 @@ Phase 2 provides the core notification management API with structured schemas, d
 - **Python**: 3.12+
 - **Framework**: FastAPI
 - **Database**: PostgreSQL
+- **Message Broker**: RabbitMQ
+- **Caching/Rate Limiting**: Redis
 - **ORM**: SQLAlchemy 2.x
 - **Migrations**: Alembic
 - **Validation**: Pydantic v2
@@ -39,7 +38,12 @@ NotifyHub/
 │   ├── core/
 │   │   ├── config.py            # Environment configuration settings (BaseSettings)
 │   │   ├── database.py          # SQLAlchemy 2.0 engine & session setup
-│   │   └── security.py          # Password hashing (bcrypt) & JWT token utilities
+│   │   ├── security.py          # Password hashing (bcrypt) & JWT token utilities
+│   │   ├── redis.py             # Redis async connection pool
+│   │   └── rate_limiter.py      # Redis rate limiting dependency
+│   ├── messaging/
+│   │   ├── publisher.py         # RabbitMQ notification publisher & DLQ logic
+│   │   └── rabbitmq.py          # RabbitMQ connection setup
 │   ├── models/
 │   │   ├── enums.py             # NotificationType, NotificationChannel, NotificationStatus enums
 │   │   ├── user.py              # SQLAlchemy 2.0 User model (users table)
@@ -50,10 +54,14 @@ NotifyHub/
 │   │   └── notification.py      # Pydantic v2 Notification schemas & paginated responses
 │   ├── services/
 │   │   ├── auth_service.py      # Authentication business logic layer
+│   │   ├── delivery_service.py  # Notification dispatch & error simulation logic
 │   │   └── notification_service.py # Notification business logic layer
 │   └── repositories/
 │       ├── user_repository.py   # User persistence layer
 │       └── notification_repository.py # Notification query & persistence layer
+├── worker/
+│   ├── __init__.py
+│   └── notification_worker.py   # RabbitMQ async consumer and retry handler
 ├── alembic/
 │   ├── env.py                   # Alembic environment runner
 │   ├── script.py.mpy            # Alembic revision template
@@ -64,13 +72,15 @@ NotifyHub/
 │   ├── conftest.py              # Pytest fixtures and TestClient database overrides
 │   ├── test_health.py           # Health endpoint tests
 │   ├── test_auth.py             # Registration, login, & security tests
-│   └── test_notifications.py    # Core notification management endpoint tests
+│   ├── test_notifications.py    # Core notification management endpoint tests
+│   ├── test_rate_limiter.py     # Redis rate limiting tests
+│   └── test_worker.py           # RabbitMQ background worker & retry logic tests
 ├── .env                         # Local environment variables
 ├── .env.example                 # Example environment variables template
 ├── .gitignore                   # Git ignore settings
 ├── alembic.ini                  # Alembic configuration file
 ├── Dockerfile                   # Multi-stage Docker image build specification
-├── docker-compose.yml           # Docker Compose setup (PostgreSQL & FastAPI)
+├── docker-compose.yml           # Docker Compose setup (PostgreSQL, RabbitMQ, Redis, FastAPI, Worker)
 ├── requirements.txt             # Python dependencies
 └── README.md                    # Project documentation
 ```
@@ -97,22 +107,30 @@ POSTGRES_DB=notifyhub
 JWT_SECRET_KEY=your_secure_jwt_secret_key_change_in_production
 JWT_ALGORITHM=HS256
 ACCESS_TOKEN_EXPIRE_MINUTES=30
+RABBITMQ_USER=guest
+RABBITMQ_PASSWORD=guest
+RABBITMQ_QUEUE=notifications
+RABBITMQ_DLQ=notifications.dlq
+MAX_NOTIFICATION_RETRIES=3
+REDIS_HOST=redis
+REDIS_PORT=6379
 ```
 
 ---
 
 ### 2. Running with Docker Compose
 
-Start the PostgreSQL database and FastAPI backend services:
+Start the entire infrastructure (PostgreSQL, Redis, RabbitMQ, FastAPI Backend, Notification Worker):
 
 ```bash
 docker compose up --build
 ```
 
 The container setup automatically:
-1. Starts PostgreSQL database container (`notifyhub_db`) and waits for health check pass (`pg_isready`).
-2. Runs Alembic database migrations (`alembic upgrade head`).
-3. Starts the FastAPI server (`notifyhub_api`) at `http://localhost:8000`.
+1. Starts **PostgreSQL** (`notifyhub_db`), **Redis** (`notifyhub_redis`), and **RabbitMQ** (`notifyhub_rabbitmq`) and waits for their respective health checks to pass.
+2. Runs Alembic database migrations (`alembic upgrade head`) automatically before launching the API.
+3. Starts the **FastAPI Server** (`notifyhub_api`) at `http://localhost:8000`.
+4. Starts the **Background Worker** (`notifyhub_worker`) to asynchronously process notification deliveries.
 
 ---
 
@@ -138,7 +156,7 @@ alembic revision --autogenerate -m "describe_migration"
 
 ### 4. Running Tests
 
-To run the pytest suite:
+To run the full pytest suite (covers authentication, health, notifications, rate limiting, and worker logic):
 
 ```bash
 # Local virtual environment
@@ -171,6 +189,7 @@ All notification endpoints require a valid JWT Bearer token (`Authorization: Bea
 - **Recipient Binding**: Clients cannot specify an arbitrary `user_id`. The recipient user ID is derived strictly from the authenticated JWT token payload.
 - **Strict Isolation**: A user can never read, modify, or list notifications belonging to another user.
 - **404 Masking**: Attempting to fetch or update another user's notification returns a `404 Not Found` response to avoid exposing resource existence.
+- **Rate Limiting**: Notification creation is protected by an atomic Redis pipeline rate limiter, restricting users to 5 requests per minute per IP/user combo. Exceeding the limit results in a `429 Too Many Requests` response.
 
 ---
 
