@@ -11,6 +11,10 @@ class DeliveryService:
         """
         logger.info(f"[NotificationWorker] Sending {notification.channel.value} notification {notification.id} to user {notification.user_id}")
         
+        # Simulate failure for testing purposes
+        if notification.content and "[FAIL]" in notification.content:
+            raise Exception("Simulated delivery failure")
+            
         # Simulate some logic (e.g., formatting, calling external API)
         # Here we just assume success.
         

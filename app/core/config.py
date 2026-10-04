@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     RABBITMQ_USER: str = "guest"
     RABBITMQ_PASSWORD: str = "guest"
     RABBITMQ_QUEUE: str = "notifications"
+    RABBITMQ_DLQ: str = "notifications.dlq"
+    MAX_NOTIFICATION_RETRIES: int = 3
 
     REDIS_HOST: str = "localhost"
     REDIS_PORT: int = 6379

@@ -2,6 +2,8 @@ import json
 import logging
 import uuid
 import time
+import threading
+import functools
 from datetime import datetime, timezone
 import pika
 from sqlalchemy.orm import Session
@@ -54,6 +56,14 @@ class NotificationWorker:
              logger.error("[NotificationWorker] Connection closed by broker.")
              
     def _process_message(self, ch, method, properties, body):
+        thread = threading.Thread(target=self._do_work, args=(ch, method, properties, body))
+        thread.start()
+
+    def _ack_message(self, ch, delivery_tag):
+        if ch.is_open:
+            ch.basic_ack(delivery_tag=delivery_tag)
+
+    def _do_work(self, ch, method, properties, body):
         db: Session = SessionLocal()
         try:
             logger.info(f"[NotificationWorker] Message received: {body}")
@@ -62,25 +72,30 @@ class NotificationWorker:
             
             if not notification_id_str:
                 logger.error("No notification_id found in message body.")
-                ch.basic_ack(delivery_tag=method.delivery_tag)
+                self._connection.add_callback_threadsafe(functools.partial(self._ack_message, ch, method.delivery_tag))
                 return
                 
             try:
                 notification_id = uuid.UUID(notification_id_str)
             except ValueError:
                 logger.error(f"Invalid notification_id format: {notification_id_str}")
-                ch.basic_ack(delivery_tag=method.delivery_tag)
+                self._connection.add_callback_threadsafe(functools.partial(self._ack_message, ch, method.delivery_tag))
                 return
 
             notification = db.query(Notification).filter(Notification.id == notification_id).first()
             if not notification:
                 logger.warning(f"Notification {notification_id} not found in database.")
-                ch.basic_ack(delivery_tag=method.delivery_tag)
+                self._connection.add_callback_threadsafe(functools.partial(self._ack_message, ch, method.delivery_tag))
                 return
 
             if notification.status == NotificationStatus.SENT:
                 logger.info(f"Notification {notification_id} is already SENT. Ignoring.")
-                ch.basic_ack(delivery_tag=method.delivery_tag)
+                self._connection.add_callback_threadsafe(functools.partial(self._ack_message, ch, method.delivery_tag))
+                return
+
+            if notification.status == NotificationStatus.FAILED:
+                logger.info(f"Notification {notification_id} is already FAILED. Ignoring.")
+                self._connection.add_callback_threadsafe(functools.partial(self._ack_message, ch, method.delivery_tag))
                 return
 
             if notification.status == NotificationStatus.PENDING:
@@ -93,7 +108,7 @@ class NotificationWorker:
                 if not updated:
                     logger.warning(f"Failed to transition notification {notification_id} to PROCESSING. Another worker might have processed it.")
                     db.rollback()
-                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                    self._connection.add_callback_threadsafe(functools.partial(self._ack_message, ch, method.delivery_tag))
                     return
                 
                 db.commit()
@@ -101,25 +116,58 @@ class NotificationWorker:
 
             logger.info(f"[NotificationWorker] Notification processing started for {notification_id}")
             
-            # Simulate delivery
-            success = DeliveryService.send_notification(notification)
-            
-            if success:
-                notification.status = NotificationStatus.SENT
-                notification.sent_at = datetime.now(timezone.utc)
+            try:
+                # Simulate delivery
+                success = DeliveryService.send_notification(notification)
+                if success:
+                    notification.status = NotificationStatus.SENT
+                    notification.sent_at = datetime.now(timezone.utc)
+                    db.commit()
+                    logger.info(f"[NotificationWorker] Notification processing succeeded for {notification_id}")
+                    self._connection.add_callback_threadsafe(functools.partial(self._ack_message, ch, method.delivery_tag))
+                    logger.info(f"[NotificationWorker] Message acknowledged for {notification_id}")
+                else:
+                    raise Exception("Delivery service returned false")
+            except Exception as delivery_error:
+                db.rollback()
+                logger.error(f"[NotificationWorker] Delivery failed for {notification_id}: {delivery_error}")
+                
+                # Atomically increment retry count
+                # Using conditional update
+                updated_retry = db.query(Notification).filter(
+                    Notification.id == notification_id
+                ).update({Notification.retry_count: Notification.retry_count + 1})
                 db.commit()
-                logger.info(f"[NotificationWorker] Notification processing succeeded for {notification_id}")
-                ch.basic_ack(delivery_tag=method.delivery_tag)
-                logger.info(f"[NotificationWorker] Message acknowledged for {notification_id}")
-            else:
-                notification.status = NotificationStatus.FAILED
-                db.commit()
-                logger.error(f"[NotificationWorker] Notification processing failed for {notification_id}")
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                db.refresh(notification)
+                
+                logger.info(f"[NotificationWorker] Delivery failed for {notification_id}, retry_count={notification.retry_count}")
+                
+                try:
+                    if notification.retry_count < settings.MAX_NOTIFICATION_RETRIES:
+                        notification.status = NotificationStatus.PENDING
+                        db.commit()
+                        from app.messaging.publisher import publisher
+                        publisher.publish_notification(notification_id)
+                        logger.info(f"[NotificationWorker] Re-published {notification_id} for retry")
+                    else:
+                        logger.warning(f"[NotificationWorker] Retry limit reached for {notification_id}")
+                        notification.status = NotificationStatus.FAILED
+                        db.commit()
+                        from app.messaging.publisher import publisher
+                        publisher.publish_to_dlq(notification_id)
+                        logger.info(f"[NotificationWorker] Notification {notification_id} moved to DLQ")
+                        
+                    self._connection.add_callback_threadsafe(functools.partial(self._ack_message, ch, method.delivery_tag))
+                except Exception as publish_error:
+                    logger.error(f"[NotificationWorker] Failed to publish retry/DLQ message for {notification_id}: {publish_error}")
+                    # DO NOT ACK. Return so that it remains unacknowledged and can be redelivered.
+                    return
                 
         except Exception as e:
             logger.error(f"[NotificationWorker] Unexpected error processing message: {e}")
             db.rollback()
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            # We acknowledge the message instead of requeuing to prevent infinite loops on malformed messages.
+            # Real-world applications might want to DLQ it directly.
+            self._connection.add_callback_threadsafe(functools.partial(self._ack_message, ch, method.delivery_tag))
         finally:
             db.close()

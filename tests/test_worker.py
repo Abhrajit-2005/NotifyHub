@@ -16,6 +16,8 @@ def mock_worker():
         with patch('worker.notification_worker.SessionLocal', new=TestingSessionLocal):
             mock_channel = MagicMock()
             mock_conn.return_value.channel.return_value = mock_channel
+            mock_conn.return_value.add_callback_threadsafe = lambda cb: cb()
+            
             worker = NotificationWorker()
             yield worker
 
@@ -54,18 +56,15 @@ def test_worker_processes_pending_notification(mock_worker, db: Session, test_no
     
     body = json.dumps({"notification_id": str(test_notification.id)}).encode('utf-8')
     
-    mock_worker._process_message(mock_ch, mock_method, None, body)
+    mock_worker._do_work(mock_ch, mock_method, None, body)
     
-    # Assert message was acked
     mock_ch.basic_ack.assert_called_once_with(delivery_tag=1)
-    
-    # Assert notification status updated
     db.refresh(test_notification)
     assert test_notification.status == NotificationStatus.SENT
     assert test_notification.sent_at is not None
+    assert test_notification.retry_count == 0
 
 def test_worker_does_not_process_sent_notification(mock_worker, db: Session, test_notification: Notification):
-    # Set it to SENT before processing
     test_notification.status = NotificationStatus.SENT
     db.commit()
     
@@ -74,43 +73,151 @@ def test_worker_does_not_process_sent_notification(mock_worker, db: Session, tes
     mock_method.delivery_tag = 1
     
     body = json.dumps({"notification_id": str(test_notification.id)}).encode('utf-8')
+    mock_worker._do_work(mock_ch, mock_method, None, body)
     
-    mock_worker._process_message(mock_ch, mock_method, None, body)
-    
-    # Should be acked
     mock_ch.basic_ack.assert_called_once_with(delivery_tag=1)
-    
-    # Should still be SENT, but sent_at shouldn't change
     db.refresh(test_notification)
     assert test_notification.status == NotificationStatus.SENT
 
-@patch('worker.notification_worker.DeliveryService.send_notification')
-def test_worker_failed_processing_nacks(mock_send, mock_worker, db: Session, test_notification: Notification):
-    mock_send.return_value = False
+def test_worker_does_not_process_failed_notification(mock_worker, db: Session, test_notification: Notification):
+    test_notification.status = NotificationStatus.FAILED
+    db.commit()
     
     mock_ch = MagicMock()
     mock_method = MagicMock()
     mock_method.delivery_tag = 1
     
     body = json.dumps({"notification_id": str(test_notification.id)}).encode('utf-8')
+    mock_worker._do_work(mock_ch, mock_method, None, body)
     
-    mock_worker._process_message(mock_ch, mock_method, None, body)
-    
-    # Assert message was nacked, not requeued (as configured for failed delivery)
-    mock_ch.basic_nack.assert_called_once_with(delivery_tag=1, requeue=False)
-    
+    mock_ch.basic_ack.assert_called_once_with(delivery_tag=1)
     db.refresh(test_notification)
     assert test_notification.status == NotificationStatus.FAILED
 
-def test_worker_exception_nacks_and_requeues(mock_worker, db: Session, test_notification: Notification):
-    # Pass invalid JSON body to cause an exception
+def test_missing_notification_acks(mock_worker, db: Session):
     mock_ch = MagicMock()
     mock_method = MagicMock()
     mock_method.delivery_tag = 1
     
-    body = b"invalid json"
+    body = json.dumps({"notification_id": str(uuid.uuid4())}).encode('utf-8')
+    mock_worker._do_work(mock_ch, mock_method, None, body)
     
-    mock_worker._process_message(mock_ch, mock_method, None, body)
+    mock_ch.basic_ack.assert_called_once_with(delivery_tag=1)
+
+@patch('app.messaging.publisher.NotificationPublisher.publish_notification')
+def test_first_delivery_failure_retries(mock_publish, mock_worker, db: Session, test_notification: Notification):
+    test_notification.content = "Test notification [FAIL]"
+    db.commit()
     
-    # Exception during parsing should cause NACK with requeue=True
-    mock_ch.basic_nack.assert_called_once_with(delivery_tag=1, requeue=True)
+    mock_ch = MagicMock()
+    mock_method = MagicMock()
+    mock_method.delivery_tag = 1
+    
+    body = json.dumps({"notification_id": str(test_notification.id)}).encode('utf-8')
+    mock_worker._do_work(mock_ch, mock_method, None, body)
+    
+    mock_ch.basic_ack.assert_called_once_with(delivery_tag=1)
+    mock_publish.assert_called_once_with(test_notification.id)
+    
+    db.refresh(test_notification)
+    assert test_notification.retry_count == 1
+    assert test_notification.status == NotificationStatus.PENDING
+
+@patch('app.messaging.publisher.NotificationPublisher.publish_notification')
+def test_second_delivery_failure_retries(mock_publish, mock_worker, db: Session, test_notification: Notification):
+    test_notification.content = "Test notification [FAIL]"
+    test_notification.retry_count = 1
+    db.commit()
+    
+    mock_ch = MagicMock()
+    mock_method = MagicMock()
+    mock_method.delivery_tag = 1
+    
+    body = json.dumps({"notification_id": str(test_notification.id)}).encode('utf-8')
+    mock_worker._do_work(mock_ch, mock_method, None, body)
+    
+    mock_ch.basic_ack.assert_called_once_with(delivery_tag=1)
+    mock_publish.assert_called_once_with(test_notification.id)
+    
+    db.refresh(test_notification)
+    assert test_notification.retry_count == 2
+    assert test_notification.status == NotificationStatus.PENDING
+
+@patch('app.messaging.publisher.NotificationPublisher.publish_to_dlq')
+def test_third_delivery_failure_dlq(mock_dlq, mock_worker, db: Session, test_notification: Notification):
+    test_notification.content = "Test notification [FAIL]"
+    test_notification.retry_count = 2
+    # The max is 3, wait, if it's 2, incrementing makes it 3. If it's < 3 it retries, else DLQ.
+    db.commit()
+    
+    mock_ch = MagicMock()
+    mock_method = MagicMock()
+    mock_method.delivery_tag = 1
+    
+    body = json.dumps({"notification_id": str(test_notification.id)}).encode('utf-8')
+    mock_worker._do_work(mock_ch, mock_method, None, body)
+    
+    mock_ch.basic_ack.assert_called_once_with(delivery_tag=1)
+    mock_dlq.assert_called_once_with(test_notification.id)
+    
+    db.refresh(test_notification)
+    assert test_notification.retry_count == 3
+    assert test_notification.status == NotificationStatus.FAILED
+
+def test_successful_retry(mock_worker, db: Session, test_notification: Notification):
+    # Simulate a notification that failed previously but now will succeed
+    test_notification.retry_count = 1
+    test_notification.content = "Normal notification"
+    db.commit()
+    
+    mock_ch = MagicMock()
+    mock_method = MagicMock()
+    mock_method.delivery_tag = 1
+    
+    body = json.dumps({"notification_id": str(test_notification.id)}).encode('utf-8')
+    mock_worker._do_work(mock_ch, mock_method, None, body)
+    
+    mock_ch.basic_ack.assert_called_once_with(delivery_tag=1)
+    
+    db.refresh(test_notification)
+    assert test_notification.status == NotificationStatus.SENT
+    assert test_notification.retry_count == 1  # unchanged because it succeeded
+
+@patch('app.messaging.publisher.NotificationPublisher.publish_notification')
+def test_retry_publish_fails_no_ack(mock_publish, mock_worker, db: Session, test_notification: Notification):
+    test_notification.content = "Test notification [FAIL]"
+    db.commit()
+    
+    mock_publish.side_effect = Exception("AMQP error")
+    
+    mock_ch = MagicMock()
+    mock_method = MagicMock()
+    mock_method.delivery_tag = 1
+    
+    body = json.dumps({"notification_id": str(test_notification.id)}).encode('utf-8')
+    mock_worker._do_work(mock_ch, mock_method, None, body)
+    
+    mock_ch.basic_ack.assert_not_called()
+    db.refresh(test_notification)
+    assert test_notification.retry_count == 1
+    assert test_notification.status == NotificationStatus.PENDING
+
+@patch('app.messaging.publisher.NotificationPublisher.publish_to_dlq')
+def test_dlq_publish_fails_no_ack(mock_dlq, mock_worker, db: Session, test_notification: Notification):
+    test_notification.content = "Test notification [FAIL]"
+    test_notification.retry_count = 2
+    db.commit()
+    
+    mock_dlq.side_effect = Exception("AMQP error")
+    
+    mock_ch = MagicMock()
+    mock_method = MagicMock()
+    mock_method.delivery_tag = 1
+    
+    body = json.dumps({"notification_id": str(test_notification.id)}).encode('utf-8')
+    mock_worker._do_work(mock_ch, mock_method, None, body)
+    
+    mock_ch.basic_ack.assert_not_called()
+    db.refresh(test_notification)
+    assert test_notification.retry_count == 3
+    assert test_notification.status == NotificationStatus.FAILED
